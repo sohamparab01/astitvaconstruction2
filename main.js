@@ -24,15 +24,15 @@
   const STOP_THRESHOLD = 3.0; // Clean snap within 0.2 frame to prevent slow tail drag
   const FRAME_STEP = MAX_VIRTUAL_SCROLL / (TOTAL_FRAMES - 1); // ~13.96 units per unique frame
 
-  // Controlled throughput & directional lookahead (Phases 2 & 5)
-  const MAX_CONCURRENT_REQUESTS = 3; // 3 concurrent requests: optimal throughput without network/CPU congestion
-  const LOOKAHEAD_FRAMES = 18; // 18 frames ahead in active scroll direction
-  const LOOKBEHIND_FRAMES = 6;  // 6 frames behind cursor for smooth reversals
+  // Controlled throughput & directional lookahead (Priority 1 & 2)
+  const MAX_CONCURRENT_REQUESTS = 4; // 4 concurrent requests: optimal throughput without network/CPU congestion
+  const LOOKAHEAD_FRAMES = 20; // 20 frames ahead in active scroll direction
+  const LOOKBEHIND_FRAMES = 8;  // 8 frames behind cursor for smooth reversals
   const INITIAL_WARMUP_FRAMES = 14; // Preload only first 14 frames on initial visit (~3.5 MB total)
 
-  // Memory limits (Phase 4): Bounded LRU/proximity cache
+  // Memory limits: Bounded LRU/proximity cache (Priority 1)
   const isMobile = () => (typeof window !== 'undefined' && window.innerWidth < 768);
-  const getMaxCacheSize = () => (isMobile() ? 12 : 20);
+  const getMaxCacheSize = () => (isMobile() ? 30 : 36);
 
   // Ensure clean initial load at top without scroll restoration flashing solid header
   if ('scrollRestoration' in history) {
@@ -61,9 +61,10 @@
   let lastDrawnImage = null;
   let scrollDirection = 1; // 1 = forward/down, -1 = reverse/up
 
-  // Bounded frame cache (Phase 4): frameIndex -> { img, lastUsed }
+  // Bounded frame cache (Priority 1): frameIndex -> { img, lastUsed }
   const frameCache = new Map();
-  const requestedFrames = new Set(); // frameIndices currently loading or queued
+  const requestedFrames = new Set(); // frameIndices currently loading over network
+  const decodingFrames = new Set();  // frameIndices currently decoding off-thread
   let priorityQueue = []; // High-priority frames near active scroll
   let activeRequests = 0;
   let isRenderPending = false;
@@ -138,7 +139,7 @@
     ctx.drawImage(img, drawX, drawY, drawW, drawH);
   }
 
-  // --- Bounded Memory Cache Management (Phase 4: Proximity & LRU Eviction) ---
+  // --- Bounded Memory Cache Management (Priority 1: Zero-Thrashing Proximity Eviction) ---
   function addToCache(frameIndex, img) {
     frameCache.set(frameIndex, {
       img,
@@ -153,58 +154,80 @@
 
   function evictDistantFrames(targetSize) {
     while (frameCache.size > targetSize) {
-      let furthestFrame = null;
-      let maxDist = -1;
+      let candidateFrame = null;
+      let maxScore = -1;
 
-      // Find frame with largest distance from current active position
+      const isForward = scrollDirection >= 0;
+      const forwardWindow = isForward ? LOOKAHEAD_FRAMES : LOOKBEHIND_FRAMES;
+      const backwardWindow = isForward ? LOOKBEHIND_FRAMES : LOOKAHEAD_FRAMES;
+
+      // Find frame with largest distance outside the active preload window
       for (const [idx] of frameCache.entries()) {
         // Protect current frame, last drawn frame, and frame 1 when near top
         if (idx === currentFrameIndex || idx === lastDrawnFrameIndex) continue;
         if (idx === 1 && currentFrameIndex <= 5) continue;
 
+        const isAhead = idx > currentFrameIndex;
         const dist = Math.abs(idx - currentFrameIndex);
-        if (dist > maxDist) {
-          maxDist = dist;
-          furthestFrame = idx;
+
+        // Protect frames inside the active lookahead/lookbehind window
+        const isInsideActiveWindow = isAhead 
+          ? (dist <= forwardWindow) 
+          : (dist <= backwardWindow);
+
+        // Priority 1: Frames outside the active window get a high score so they are always evicted first
+        let score = dist;
+        if (!isInsideActiveWindow) {
+          score += 1000;
+          // When moving forward, frames far behind get additional eviction priority
+          if (isForward && !isAhead) score += dist * 0.5;
+          // When moving backward, frames far ahead get additional eviction priority
+          if (!isForward && isAhead) score += dist * 0.5;
+        }
+
+        if (score > maxScore) {
+          maxScore = score;
+          candidateFrame = idx;
         }
       }
 
-      if (furthestFrame !== null) {
-        const item = frameCache.get(furthestFrame);
+      if (candidateFrame !== null) {
+        const item = frameCache.get(candidateFrame);
         if (item && item.img) {
           item.img.onload = null;
           item.img.onerror = null;
           item.img.src = ''; // Release GPU / browser bitmap memory
         }
-        frameCache.delete(furthestFrame);
-        requestedFrames.delete(furthestFrame);
+        frameCache.delete(candidateFrame);
+        requestedFrames.delete(candidateFrame);
+        decodingFrames.delete(candidateFrame);
       } else {
         break;
       }
     }
   }
 
-  // --- Direction-Aware Staged Preloader Engine (Phase 2 & Phase 3) ---
+  // --- Direction-Aware Staged Preloader Engine (Priority 2 & 3: Decoupled & Starvation-Free) ---
   function updatePriorityPreload(targetFrame) {
     const desired = [];
 
     // 1. Target frame is absolute first priority
-    if (!frameCache.has(targetFrame) && !requestedFrames.has(targetFrame)) {
+    if (!frameCache.has(targetFrame) && !requestedFrames.has(targetFrame) && !decodingFrames.has(targetFrame)) {
       desired.push(targetFrame);
     }
 
-    // 2. Directional lookahead in active scrub direction
+    // 2. Immediate lookahead in active scrub direction (closest to target first!)
     for (let i = 1; i <= LOOKAHEAD_FRAMES; i++) {
       const idx = targetFrame + i * scrollDirection;
-      if (idx >= 1 && idx <= TOTAL_FRAMES && !frameCache.has(idx) && !requestedFrames.has(idx)) {
+      if (idx >= 1 && idx <= TOTAL_FRAMES && !frameCache.has(idx) && !requestedFrames.has(idx) && !decodingFrames.has(idx)) {
         desired.push(idx);
       }
     }
 
-    // 3. Lookbehind frames for immediate direction reversal response
+    // 3. Immediate lookbehind frames for fast directional reversals
     for (let i = 1; i <= LOOKBEHIND_FRAMES; i++) {
       const idx = targetFrame - i * scrollDirection;
-      if (idx >= 1 && idx <= TOTAL_FRAMES && !frameCache.has(idx) && !requestedFrames.has(idx)) {
+      if (idx >= 1 && idx <= TOTAL_FRAMES && !frameCache.has(idx) && !requestedFrames.has(idx) && !decodingFrames.has(idx)) {
         desired.push(idx);
       }
     }
@@ -220,13 +243,13 @@
       // Pull from the priority queue (direction-aware sliding window or warmup buffer)
       while (priorityQueue.length > 0) {
         const candidate = priorityQueue.shift();
-        if (!requestedFrames.has(candidate) && !frameCache.has(candidate)) {
+        if (!requestedFrames.has(candidate) && !frameCache.has(candidate) && !decodingFrames.has(candidate)) {
           nextFrame = candidate;
           break;
         }
       }
 
-      // NO runaway global loop! Stop when priorityQueue is serviced.
+      // Stop when priorityQueue is serviced
       if (nextFrame === null) {
         break;
       }
@@ -236,7 +259,7 @@
   }
 
   function fetchFrame(frameIndex) {
-    if (requestedFrames.has(frameIndex) || frameCache.has(frameIndex)) return;
+    if (requestedFrames.has(frameIndex) || frameCache.has(frameIndex) || decodingFrames.has(frameIndex)) return;
     requestedFrames.add(frameIndex);
     activeRequests++;
 
@@ -244,37 +267,47 @@
       const img = new Image();
       img.decoding = 'async';
 
-      img.onload = async () => {
-        // Phase 3: Off-thread asynchronous decoding before canvas draw
-        try {
-          if (img.decode) {
-            await img.decode();
-          }
-        } catch (e) {
-          // Non-critical: image can still be drawn if decode promise rejects
-        }
-
+      img.onload = () => {
+        // Priority 2: Release network slot immediately when download completes so next download starts
         activeRequests = Math.max(0, activeRequests - 1);
-        addToCache(frameIndex, img);
-
-        const isBetter = (scrollDirection >= 0 && frameIndex > lastDrawnFrameIndex && frameIndex <= currentFrameIndex) ||
-                         (scrollDirection < 0 && frameIndex < lastDrawnFrameIndex && frameIndex >= currentFrameIndex) ||
-                         frameIndex === currentFrameIndex;
-
-        if (isBetter || (frameIndex === 1 && lastDrawnFrameIndex === -1)) {
-          requestRender();
-        }
-
+        requestedFrames.delete(frameIndex);
+        decodingFrames.add(frameIndex);
         pumpLoader();
+
+        // Priority 2: Off-thread background decoding tracked separately from network activity
+        const onDecoded = () => {
+          decodingFrames.delete(frameIndex);
+          addToCache(frameIndex, img);
+
+          // Priority 2 & 3: Frame is only rendered after successful decoding
+          const isBetter = (scrollDirection >= 0 && frameIndex > lastDrawnFrameIndex && frameIndex <= currentFrameIndex) ||
+                           (scrollDirection < 0 && frameIndex < lastDrawnFrameIndex && frameIndex >= currentFrameIndex) ||
+                           frameIndex === currentFrameIndex;
+
+          if (isBetter || (frameIndex === 1 && lastDrawnFrameIndex === -1)) {
+            requestRender();
+          }
+        };
+
+        if ('decode' in img) {
+          img.decode().then(onDecoded).catch(() => {
+            // Safe fallback if decode promise rejects: still add to cache and render
+            onDecoded();
+          });
+        } else {
+          onDecoded();
+        }
       };
 
       img.onerror = () => {
         if (!isFallback) {
-          // Phase 1: Robust fallback to original PNG if WebP fails
+          // Priority 2: Robust fallback to original PNG if WebP fails
           tryLoad(getFrameUrl(frameIndex, 'png'), true);
         } else {
+          // Priority 2: Failed requests do not block the queue
           activeRequests = Math.max(0, activeRequests - 1);
           requestedFrames.delete(frameIndex);
+          decodingFrames.delete(frameIndex);
           pumpLoader();
         }
       };
@@ -340,6 +373,12 @@
     if (isAtTop) {
       if (e.deltaY > 0) {
         // Scrolling DOWN while at the top:
+        // Priority 2: Immediate directional lookahead shift on forward scroll
+        if (scrollDirection < 0) {
+          scrollDirection = 1;
+          updatePriorityPreload(currentFrameIndex);
+        }
+
         // If animation is not yet 100% completed, intercept wheel and advance frames
         if (targetVirtualScroll < MAX_VIRTUAL_SCROLL || currentVirtualScroll < MAX_VIRTUAL_SCROLL - 15) {
           e.preventDefault();
@@ -357,6 +396,12 @@
         // Allow the browser to naturally scroll down into the rest of the homepage!
       } else if (e.deltaY < 0) {
         // Scrolling UP while at the top:
+        // Priority 2: Immediate directional lookahead shift on reverse scroll
+        if (scrollDirection > 0) {
+          scrollDirection = -1;
+          updatePriorityPreload(currentFrameIndex);
+        }
+
         // If frames have progressed (targetVirtualScroll > 0), scrub them back in reverse!
         if (targetVirtualScroll > 0) {
           e.preventDefault();
@@ -390,7 +435,12 @@
 
       if (isAtTop) {
         if (deltaY > 0) {
-          // Swiping up (trying to scroll down)
+          // Swiping up (trying to scroll down / advance frames)
+          if (scrollDirection < 0) {
+            scrollDirection = 1;
+            updatePriorityPreload(currentFrameIndex);
+          }
+
           if (targetVirtualScroll < MAX_VIRTUAL_SCROLL || currentVirtualScroll < MAX_VIRTUAL_SCROLL - 15) {
             if (e.cancelable) e.preventDefault();
             targetVirtualScroll = clamp(
@@ -402,7 +452,12 @@
             return;
           }
         } else if (deltaY < 0) {
-          // Swiping down (trying to scroll up / reverse)
+          // Swiping down (trying to scroll up / reverse frames)
+          if (scrollDirection > 0) {
+            scrollDirection = -1;
+            updatePriorityPreload(currentFrameIndex);
+          }
+
           if (targetVirtualScroll > 0) {
             if (e.cancelable) e.preventDefault();
             targetVirtualScroll = clamp(
@@ -423,12 +478,20 @@
     if (!isAtTop) return;
 
     if (e.key === 'ArrowDown' || e.key === 'PageDown' || e.key === ' ') {
+      if (scrollDirection < 0) {
+        scrollDirection = 1;
+        updatePriorityPreload(currentFrameIndex);
+      }
       if (targetVirtualScroll < MAX_VIRTUAL_SCROLL || currentVirtualScroll < MAX_VIRTUAL_SCROLL - 15) {
         e.preventDefault();
         targetVirtualScroll = clamp(targetVirtualScroll + 160, 0, MAX_VIRTUAL_SCROLL);
         requestRender();
       }
     } else if (e.key === 'ArrowUp' || e.key === 'PageUp') {
+      if (scrollDirection > 0) {
+        scrollDirection = -1;
+        updatePriorityPreload(currentFrameIndex);
+      }
       if (targetVirtualScroll > 0) {
         e.preventDefault();
         targetVirtualScroll = clamp(targetVirtualScroll - 160, 0, MAX_VIRTUAL_SCROLL);
