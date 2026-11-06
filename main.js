@@ -69,6 +69,19 @@
   let activeRequests = 0;
   let isRenderPending = false;
 
+  // --- Conservative Background Idle Warmup Engine ---
+  const idleWarmedFrames = new Set();
+  const idleRetryCounts = new Map();
+  const MAX_IDLE_RETRIES = 2;
+  let idlePendingFrame = null;
+  let idleWarmupHandle = null;
+  let activeIdleRequests = 0;
+  let isInteractionActive = false;
+  let interactionResumeTimer = null;
+  let initialWarmupSettled = false;
+
+  const getIdleWarmupTargetCount = () => (isMobile() ? 15 : 30);
+
   // Cached layout measurements (Phase 5: prevent synchronous layout thrashing)
   let cachedHeroHeight = window.innerHeight;
 
@@ -258,10 +271,166 @@
     }
   }
 
+  // --- Conservative Background Idle Warmup System ---
+  function isNetworkConstrained() {
+    if (typeof navigator !== 'undefined' && navigator.connection) {
+      if (navigator.connection.saveData === true) return true;
+      const et = navigator.connection.effectiveType;
+      if (et === 'slow-2g' || et === '2g') return true;
+    }
+    return false;
+  }
+
+  const scheduleIdle = (typeof window !== 'undefined' && typeof window.requestIdleCallback === 'function')
+    ? (cb) => window.requestIdleCallback(cb, { timeout: 2000 })
+    : (cb) => setTimeout(cb, 200);
+
+  const cancelIdle = (typeof window !== 'undefined' && typeof window.cancelIdleCallback === 'function')
+    ? (handle) => window.cancelIdleCallback(handle)
+    : (handle) => clearTimeout(handle);
+
+  function cancelScheduledIdle() {
+    if (idleWarmupHandle !== null) {
+      cancelIdle(idleWarmupHandle);
+      idleWarmupHandle = null;
+    }
+  }
+
+  function suspendIdleWarmup() {
+    cancelScheduledIdle();
+    isInteractionActive = true;
+    if (interactionResumeTimer !== null) {
+      clearTimeout(interactionResumeTimer);
+    }
+    interactionResumeTimer = setTimeout(() => {
+      isInteractionActive = false;
+      interactionResumeTimer = null;
+      checkAndScheduleIdleWarmup();
+    }, 2000);
+  }
+
+  function getNextIdleWarmupFrame() {
+    const targetCount = getIdleWarmupTargetCount();
+    if (idleWarmedFrames.size >= targetCount) {
+      return null;
+    }
+
+    const startIdx = INITIAL_WARMUP_FRAMES + 1;
+    const maxIdx = Math.min(TOTAL_FRAMES, INITIAL_WARMUP_FRAMES + targetCount);
+
+    for (let idx = startIdx; idx <= maxIdx; idx++) {
+      const retries = idleRetryCounts.get(idx) || 0;
+      if (
+        !frameCache.has(idx) &&
+        !requestedFrames.has(idx) &&
+        !decodingFrames.has(idx) &&
+        !idleWarmedFrames.has(idx) &&
+        idlePendingFrame !== idx &&
+        retries < MAX_IDLE_RETRIES
+      ) {
+        return idx;
+      }
+    }
+    return null;
+  }
+
+  function checkAndScheduleIdleWarmup() {
+    if (
+      !initialWarmupSettled ||
+      lastDrawnFrameIndex < 1 ||
+      isInteractionActive ||
+      activeRequests > 0 ||
+      priorityQueue.length > 0 ||
+      decodingFrames.size > 0 ||
+      activeIdleRequests > 0 ||
+      idlePendingFrame !== null ||
+      (typeof document !== 'undefined' && document.hidden) ||
+      isNetworkConstrained()
+    ) {
+      return;
+    }
+
+    const nextFrame = getNextIdleWarmupFrame();
+    if (nextFrame === null) return;
+    if (idleWarmupHandle !== null) return;
+
+    idleWarmupHandle = scheduleIdle((deadline) => {
+      idleWarmupHandle = null;
+      runIdleWarmupStep(deadline);
+    });
+  }
+
+  function runIdleWarmupStep(deadline) {
+    if (
+      isInteractionActive ||
+      activeRequests > 0 ||
+      priorityQueue.length > 0 ||
+      decodingFrames.size > 0 ||
+      activeIdleRequests > 0 ||
+      idlePendingFrame !== null ||
+      (typeof document !== 'undefined' && document.hidden) ||
+      isNetworkConstrained()
+    ) {
+      return;
+    }
+
+    if (deadline && typeof deadline.timeRemaining === 'function' && deadline.timeRemaining() < 5 && !deadline.didTimeout) {
+      checkAndScheduleIdleWarmup();
+      return;
+    }
+
+    const frameIndex = getNextIdleWarmupFrame();
+    if (frameIndex === null) return;
+
+    activeIdleRequests = 1;
+    idlePendingFrame = frameIndex;
+
+    let img = new Image();
+
+    const cleanup = () => {
+      if (img) {
+        img.onload = null;
+        img.onerror = null;
+        img = null;
+      }
+      idlePendingFrame = null;
+      activeIdleRequests = 0;
+      if (!isInteractionActive && activeRequests === 0 && decodingFrames.size === 0) {
+        checkAndScheduleIdleWarmup();
+      }
+    };
+
+    img.onload = () => {
+      idleWarmedFrames.add(frameIndex);
+      idleRetryCounts.delete(frameIndex);
+      cleanup();
+    };
+
+    img.onerror = () => {
+      const retries = (idleRetryCounts.get(frameIndex) || 0) + 1;
+      idleRetryCounts.set(frameIndex, retries);
+      cleanup();
+    };
+
+    img.src = getFrameUrl(frameIndex, 'webp');
+  }
+
+  function notifyActiveRequestsSettled() {
+    if (activeRequests === 0 && priorityQueue.length === 0 && decodingFrames.size === 0) {
+      if (!initialWarmupSettled && lastDrawnFrameIndex >= 1) {
+        initialWarmupSettled = true;
+      }
+      if (initialWarmupSettled && !isInteractionActive) {
+        checkAndScheduleIdleWarmup();
+      }
+    }
+  }
+
   function fetchFrame(frameIndex) {
     if (requestedFrames.has(frameIndex) || frameCache.has(frameIndex) || decodingFrames.has(frameIndex)) return;
     requestedFrames.add(frameIndex);
     activeRequests++;
+    suspendIdleWarmup();
 
     const tryLoad = (url, isFallback = false) => {
       const img = new Image();
@@ -273,6 +442,7 @@
         requestedFrames.delete(frameIndex);
         decodingFrames.add(frameIndex);
         pumpLoader();
+        notifyActiveRequestsSettled();
 
         // Priority 2: Off-thread background decoding tracked separately from network activity
         const onDecoded = () => {
@@ -287,6 +457,8 @@
           if (isBetter || (frameIndex === 1 && lastDrawnFrameIndex === -1)) {
             requestRender();
           }
+
+          notifyActiveRequestsSettled();
         };
 
         if ('decode' in img) {
@@ -309,6 +481,7 @@
           requestedFrames.delete(frameIndex);
           decodingFrames.delete(frameIndex);
           pumpLoader();
+          notifyActiveRequestsSettled();
         }
       };
 
@@ -368,6 +541,7 @@
 
   // --- Input Handlers (Smooth Forward & Reverse Scrubbing + Page Scroll Transition) ---
   function onWheel(e) {
+    suspendIdleWarmup();
     const isAtTop = window.scrollY <= 2;
 
     if (isAtTop) {
@@ -422,6 +596,7 @@
   let touchStartVirtualScroll = 0;
 
   function onTouchStart(e) {
+    suspendIdleWarmup();
     if (e.touches.length === 1) {
       touchStartY = e.touches[0].clientY;
       touchStartVirtualScroll = targetVirtualScroll;
@@ -429,6 +604,7 @@
   }
 
   function onTouchMove(e) {
+    suspendIdleWarmup();
     if (e.touches.length === 1) {
       const isAtTop = window.scrollY <= 2;
       const deltaY = (touchStartY - e.touches[0].clientY) * 1.8;
@@ -474,6 +650,9 @@
   }
 
   function onKeyDown(e) {
+    if (['ArrowDown', 'ArrowUp', 'PageDown', 'PageUp', ' ', 'Home', 'End'].includes(e.key)) {
+      suspendIdleWarmup();
+    }
     const isAtTop = window.scrollY <= 2;
     if (!isAtTop) return;
 
@@ -501,6 +680,7 @@
   }
 
   function onWindowScroll() {
+    suspendIdleWarmup();
     requestRender();
 
     if (window.scrollY > 40) {
@@ -573,6 +753,11 @@
         drawCoverImage(bestFrame.img);
         lastDrawnImage = bestFrame.img;
         lastDrawnFrameIndex = bestFrame.index;
+
+        if (!initialWarmupSettled && activeRequests === 0 && priorityQueue.length === 0 && decodingFrames.size === 0) {
+          initialWarmupSettled = true;
+          checkAndScheduleIdleWarmup();
+        }
       }
     }
 
@@ -1499,6 +1684,14 @@
     window.addEventListener('touchmove', onTouchMove, { passive: false });
     window.addEventListener('keydown', onKeyDown);
     window.addEventListener('scroll', onWindowScroll, { passive: true });
+    window.addEventListener('pointerdown', () => suspendIdleWarmup(), { passive: true });
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) {
+        cancelScheduledIdle();
+      } else {
+        suspendIdleWarmup();
+      }
+    });
     window.addEventListener('resize', () => {
       updateCachedLayout();
       resizeCanvas();
