@@ -3,7 +3,7 @@ import path from 'path';
 import fs from 'fs';
 
 export default defineConfig({
-  base: '/astitvaconstruction2/',
+  base: '/',
   server: {
     port: 5173,
     open: false,
