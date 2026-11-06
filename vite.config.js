@@ -3,6 +3,7 @@ import path from 'path';
 import fs from 'fs';
 
 export default defineConfig({
+  base: '/astitvaconstruction2/',
   server: {
     port: 5173,
     open: false,
@@ -16,9 +17,10 @@ export default defineConfig({
       configureServer(server) {
         server.middlewares.use((req, res, next) => {
           const rawUrl = req.url ? req.url.split('?')[0] : '';
-          if (rawUrl.startsWith('/frames/')) {
+          const cleanUrl = rawUrl.replace(/^\/astitvaconstruction2\//, '/');
+          if (cleanUrl.startsWith('/frames/')) {
             try {
-              const safePath = path.normalize(path.join(process.cwd(), decodeURIComponent(rawUrl)));
+              const safePath = path.normalize(path.join(process.cwd(), decodeURIComponent(cleanUrl)));
               if (safePath.startsWith(process.cwd()) && fs.existsSync(safePath)) {
                 const stat = fs.statSync(safePath);
                 if (stat.isFile()) {

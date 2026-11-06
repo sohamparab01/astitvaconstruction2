@@ -63,6 +63,16 @@
   let activeRequests = 0;
   let isRenderPending = false;
 
+  // Base URL resolver ensuring proper asset paths on both local dev and GitHub Pages subdirectories
+  const BASE_URL = (import.meta.env && import.meta.env.BASE_URL) ? import.meta.env.BASE_URL : '/';
+  const NORMALIZED_BASE = BASE_URL.endsWith('/') ? BASE_URL : `${BASE_URL}/`;
+
+  function resolveAssetUrl(assetPath) {
+    if (!assetPath) return '';
+    const cleanPath = assetPath.startsWith('/') ? assetPath.slice(1) : assetPath;
+    return `${NORMALIZED_BASE}${cleanPath}`;
+  }
+
   // --- Utility Functions ---
   function getFrameUrl(index) {
     // Maps each logical unique frame (1..359) to its master PNG in /frames/
@@ -71,7 +81,7 @@
     // 75% of network bandwidth and preventing 4-frame static stutter during scrubbing.
     const fileIndex = (index - 1) * 4 + 1;
     const padded = String(fileIndex).padStart(4, '0');
-    return `/frames/frame_${padded}.png`;
+    return resolveAssetUrl(`frames/frame_${padded}.png`);
   }
 
   function clamp(val, min, max) {
@@ -1135,7 +1145,7 @@
       const project = visibleProjects[currentLightboxIndex];
 
       if (lightboxImg) {
-        lightboxImg.src = project.image;
+        lightboxImg.src = resolveAssetUrl(project.image);
         lightboxImg.alt = project.alt || project.name;
       }
       if (lightboxTitle) lightboxTitle.textContent = project.name;
