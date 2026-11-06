@@ -1,0 +1,28 @@
+{
+  "name": "ASTITVA CONSTRUCTION",
+  "short_name": "ASTITVA",
+  "description": "Professional building restoration, structural repairs, waterproofing, and renovation solutions.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0d1b2a",
+  "theme_color": "#c49a45",
+  "icons": [
+    {
+      "src": "/images/astitva-logo.png",
+      "sizes": "192x192 512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/apple-touch-icon.png",
+      "sizes": "180x180",
+      "type": "image/png"
+    },
+    {
+      "src": "/favicon.png",
+      "sizes": "32x32 48x48 64x64",
+      "type": "image/png"
+    }
+  ]
+}
+
