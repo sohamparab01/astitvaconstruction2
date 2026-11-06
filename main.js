@@ -14,7 +14,6 @@
   'use strict';
 
   // --- Configuration ---
-  // --- Configuration ---
   const TOTAL_FRAMES = 359; // Master unique frames (12-second 30fps master source)
   const FRAME_WIDTH = 1920;
   const FRAME_HEIGHT = 1080;
@@ -25,9 +24,15 @@
   const STOP_THRESHOLD = 3.0; // Clean snap within 0.2 frame to prevent slow tail drag
   const FRAME_STEP = MAX_VIRTUAL_SCROLL / (TOTAL_FRAMES - 1); // ~13.96 units per unique frame
 
-  const MAX_CONCURRENT_REQUESTS = 6; // Optimal non-blocking HTTP pipeline throughput
-  const PRIORITY_AHEAD = 35; // 35 unique frames ahead in active scrub direction
-  const PRIORITY_BEHIND = 10; // 10 unique frames behind cursor
+  // Controlled throughput & directional lookahead (Phases 2 & 5)
+  const MAX_CONCURRENT_REQUESTS = 3; // 3 concurrent requests: optimal throughput without network/CPU congestion
+  const LOOKAHEAD_FRAMES = 18; // 18 frames ahead in active scroll direction
+  const LOOKBEHIND_FRAMES = 6;  // 6 frames behind cursor for smooth reversals
+  const INITIAL_WARMUP_FRAMES = 14; // Preload only first 14 frames on initial visit (~3.5 MB total)
+
+  // Memory limits (Phase 4): Bounded LRU/proximity cache
+  const isMobile = () => (typeof window !== 'undefined' && window.innerWidth < 768);
+  const getMaxCacheSize = () => (isMobile() ? 12 : 20);
 
   // Ensure clean initial load at top without scroll restoration flashing solid header
   if ('scrollRestoration' in history) {
@@ -56,12 +61,19 @@
   let lastDrawnImage = null;
   let scrollDirection = 1; // 1 = forward/down, -1 = reverse/up
 
-  // Image Cache & Queues (Persistent cache - never evicts so reversing is instantaneous)
-  const loadedImages = new Map(); // frameIndex -> HTMLImageElement
+  // Bounded frame cache (Phase 4): frameIndex -> { img, lastUsed }
+  const frameCache = new Map();
   const requestedFrames = new Set(); // frameIndices currently loading or queued
   let priorityQueue = []; // High-priority frames near active scroll
   let activeRequests = 0;
   let isRenderPending = false;
+
+  // Cached layout measurements (Phase 5: prevent synchronous layout thrashing)
+  let cachedHeroHeight = window.innerHeight;
+
+  function updateCachedLayout() {
+    cachedHeroHeight = scrollContainer ? scrollContainer.offsetHeight : window.innerHeight;
+  }
 
   // Base URL resolver ensuring proper asset paths on both local dev and GitHub Pages subdirectories
   const BASE_URL = (import.meta.env && import.meta.env.BASE_URL) ? import.meta.env.BASE_URL : '/';
@@ -73,24 +85,26 @@
     return `${NORMALIZED_BASE}${cleanPath}`;
   }
 
-  // --- Utility Functions ---
-  function getFrameUrl(index) {
-    // Maps each logical unique frame (1..359) to its master PNG in /frames/
-    // Since the 1436 files contain 4 duplicate copies of every frame (1-4, 5-8, 9-12...),
-    // this directly accesses each genuine unique frame (1, 5, 9, 13, ..., 1433), eliminating
-    // 75% of network bandwidth and preventing 4-frame static stutter during scrubbing.
+  // --- Utility Functions (Phase 1: WebP with PNG Fallback) ---
+  function getFrameUrl(index, format = 'webp') {
+    // Maps each logical unique frame (1..359) to its master asset (1, 5, 9, 13, ..., 1433)
     const fileIndex = (index - 1) * 4 + 1;
     const padded = String(fileIndex).padStart(4, '0');
-    return resolveAssetUrl(`frames/frame_${padded}.png`);
+    if (format === 'png') {
+      return resolveAssetUrl(`frames/frame_${padded}.png`);
+    }
+    return resolveAssetUrl(`frames_webp/frame_${padded}.webp`);
   }
 
   function clamp(val, min, max) {
     return Math.max(min, Math.min(max, val));
   }
 
-  // --- Canvas Sizing & Cover-Fit Rendering ---
+  // --- Canvas Sizing & Cover-Fit Rendering (Phase 5: DPR tuning) ---
   function resizeCanvas() {
-    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    // 1.25 on mobile, 1.5 on desktop: razor sharp visual appearance with 45% less GPU fill-rate
+    const maxDpr = isMobile() ? 1.25 : 1.5;
+    const dpr = Math.min(window.devicePixelRatio || 1, maxDpr);
     const displayWidth = window.innerWidth;
     const displayHeight = window.innerHeight;
 
@@ -124,27 +138,73 @@
     ctx.drawImage(img, drawX, drawY, drawW, drawH);
   }
 
-  // --- Direction-Aware High-Throughput Preloader Engine ---
+  // --- Bounded Memory Cache Management (Phase 4: Proximity & LRU Eviction) ---
+  function addToCache(frameIndex, img) {
+    frameCache.set(frameIndex, {
+      img,
+      lastUsed: Date.now()
+    });
+
+    const maxCache = getMaxCacheSize();
+    if (frameCache.size > maxCache) {
+      evictDistantFrames(maxCache);
+    }
+  }
+
+  function evictDistantFrames(targetSize) {
+    while (frameCache.size > targetSize) {
+      let furthestFrame = null;
+      let maxDist = -1;
+
+      // Find frame with largest distance from current active position
+      for (const [idx] of frameCache.entries()) {
+        // Protect current frame, last drawn frame, and frame 1 when near top
+        if (idx === currentFrameIndex || idx === lastDrawnFrameIndex) continue;
+        if (idx === 1 && currentFrameIndex <= 5) continue;
+
+        const dist = Math.abs(idx - currentFrameIndex);
+        if (dist > maxDist) {
+          maxDist = dist;
+          furthestFrame = idx;
+        }
+      }
+
+      if (furthestFrame !== null) {
+        const item = frameCache.get(furthestFrame);
+        if (item && item.img) {
+          item.img.onload = null;
+          item.img.onerror = null;
+          item.img.src = ''; // Release GPU / browser bitmap memory
+        }
+        frameCache.delete(furthestFrame);
+        requestedFrames.delete(furthestFrame);
+      } else {
+        break;
+      }
+    }
+  }
+
+  // --- Direction-Aware Staged Preloader Engine (Phase 2 & Phase 3) ---
   function updatePriorityPreload(targetFrame) {
     const desired = [];
 
     // 1. Target frame is absolute first priority
-    if (!loadedImages.has(targetFrame) && !requestedFrames.has(targetFrame)) {
+    if (!frameCache.has(targetFrame) && !requestedFrames.has(targetFrame)) {
       desired.push(targetFrame);
     }
 
-    // 2. High priority lookahead in current scrub direction (forward or backward)
-    for (let i = 1; i <= PRIORITY_AHEAD; i++) {
+    // 2. Directional lookahead in active scrub direction
+    for (let i = 1; i <= LOOKAHEAD_FRAMES; i++) {
       const idx = targetFrame + i * scrollDirection;
-      if (idx >= 1 && idx <= TOTAL_FRAMES && !loadedImages.has(idx) && !requestedFrames.has(idx)) {
+      if (idx >= 1 && idx <= TOTAL_FRAMES && !frameCache.has(idx) && !requestedFrames.has(idx)) {
         desired.push(idx);
       }
     }
 
-    // 3. Compact lookbehind frames for seamless direction reversals
-    for (let i = 1; i <= PRIORITY_BEHIND; i++) {
+    // 3. Lookbehind frames for immediate direction reversal response
+    for (let i = 1; i <= LOOKBEHIND_FRAMES; i++) {
       const idx = targetFrame - i * scrollDirection;
-      if (idx >= 1 && idx <= TOTAL_FRAMES && !loadedImages.has(idx) && !requestedFrames.has(idx)) {
+      if (idx >= 1 && idx <= TOTAL_FRAMES && !frameCache.has(idx) && !requestedFrames.has(idx)) {
         desired.push(idx);
       }
     }
@@ -157,48 +217,17 @@
     while (activeRequests < MAX_CONCURRENT_REQUESTS) {
       let nextFrame = null;
 
-      // First check priority queue (closest frames in current direction)
+      // Pull from the priority queue (direction-aware sliding window or warmup buffer)
       while (priorityQueue.length > 0) {
         const candidate = priorityQueue.shift();
-        if (!requestedFrames.has(candidate) && !loadedImages.has(candidate)) {
+        if (!requestedFrames.has(candidate) && !frameCache.has(candidate)) {
           nextFrame = candidate;
           break;
         }
       }
 
-      // If priority queue is clear, use bidirectional background preloader
+      // NO runaway global loop! Stop when priorityQueue is serviced.
       if (nextFrame === null) {
-        if (scrollDirection === -1) {
-          // Scrolling UP: background loader prioritizes frames backwards towards frame 1
-          for (let idx = currentFrameIndex; idx >= 1; idx--) {
-            if (!requestedFrames.has(idx) && !loadedImages.has(idx)) {
-              nextFrame = idx;
-              break;
-            }
-          }
-        } else {
-          // Scrolling DOWN: background loader prioritizes frames forwards towards TOTAL_FRAMES
-          for (let idx = currentFrameIndex; idx <= TOTAL_FRAMES; idx++) {
-            if (!requestedFrames.has(idx) && !loadedImages.has(idx)) {
-              nextFrame = idx;
-              break;
-            }
-          }
-        }
-
-        // Global sweep if the active direction is fully loaded
-        if (nextFrame === null) {
-          for (let idx = 1; idx <= TOTAL_FRAMES; idx++) {
-            if (!requestedFrames.has(idx) && !loadedImages.has(idx)) {
-              nextFrame = idx;
-              break;
-            }
-          }
-        }
-      }
-
-      if (nextFrame === null) {
-        // All 1436 frames loaded!
         break;
       }
 
@@ -207,71 +236,92 @@
   }
 
   function fetchFrame(frameIndex) {
-    if (requestedFrames.has(frameIndex) || loadedImages.has(frameIndex)) return;
+    if (requestedFrames.has(frameIndex) || frameCache.has(frameIndex)) return;
     requestedFrames.add(frameIndex);
     activeRequests++;
 
-    const img = new Image();
-    img.decoding = 'async';
+    const tryLoad = (url, isFallback = false) => {
+      const img = new Image();
+      img.decoding = 'async';
 
-    const onComplete = () => {
-      activeRequests = Math.max(0, activeRequests - 1);
-      loadedImages.set(frameIndex, img);
+      img.onload = async () => {
+        // Phase 3: Off-thread asynchronous decoding before canvas draw
+        try {
+          if (img.decode) {
+            await img.decode();
+          }
+        } catch (e) {
+          // Non-critical: image can still be drawn if decode promise rejects
+        }
 
-      // Render immediately if this newly loaded frame is closer to active position
-      // than what's currently displayed on screen (eliminates frozen wait during glide)
-      const isBetter = (scrollDirection >= 0 && frameIndex > lastDrawnFrameIndex && frameIndex <= currentFrameIndex) ||
-                       (scrollDirection < 0 && frameIndex < lastDrawnFrameIndex && frameIndex >= currentFrameIndex) ||
-                       frameIndex === currentFrameIndex;
+        activeRequests = Math.max(0, activeRequests - 1);
+        addToCache(frameIndex, img);
 
-      if (isBetter || (frameIndex === 1 && lastDrawnFrameIndex === -1)) {
-        requestRender();
-      }
+        const isBetter = (scrollDirection >= 0 && frameIndex > lastDrawnFrameIndex && frameIndex <= currentFrameIndex) ||
+                         (scrollDirection < 0 && frameIndex < lastDrawnFrameIndex && frameIndex >= currentFrameIndex) ||
+                         frameIndex === currentFrameIndex;
 
-      pumpLoader();
+        if (isBetter || (frameIndex === 1 && lastDrawnFrameIndex === -1)) {
+          requestRender();
+        }
+
+        pumpLoader();
+      };
+
+      img.onerror = () => {
+        if (!isFallback) {
+          // Phase 1: Robust fallback to original PNG if WebP fails
+          tryLoad(getFrameUrl(frameIndex, 'png'), true);
+        } else {
+          activeRequests = Math.max(0, activeRequests - 1);
+          requestedFrames.delete(frameIndex);
+          pumpLoader();
+        }
+      };
+
+      img.src = url;
     };
 
-    img.onload = onComplete;
-
-    img.onerror = () => {
-      activeRequests = Math.max(0, activeRequests - 1);
-      pumpLoader();
-    };
-
-    img.src = getFrameUrl(frameIndex);
+    // Load WebP primary asset
+    tryLoad(getFrameUrl(frameIndex, 'webp'), false);
   }
 
   // --- Direction-Aware Frame Selection Strategy (Zero Flicker, Zero Forward Jumps) ---
   function getBestAvailableFrame(targetIndex) {
-    if (loadedImages.has(targetIndex)) {
-      return { index: targetIndex, img: loadedImages.get(targetIndex) };
+    if (frameCache.has(targetIndex)) {
+      const entry = frameCache.get(targetIndex);
+      entry.lastUsed = Date.now();
+      return { index: targetIndex, img: entry.img };
     }
 
-    // Directional lookup:
-    // When moving forward (or stopping after forward scroll), search backward from targetIndex.
-    // This guarantees we only show frames the user has already reached, avoiding the ugly
-    // glitch where the canvas flashes forward to a future frame and then jumps back.
     if (scrollDirection >= 0) {
       for (let idx = targetIndex - 1; idx >= 1; idx--) {
-        if (loadedImages.has(idx)) {
-          return { index: idx, img: loadedImages.get(idx) };
+        if (frameCache.has(idx)) {
+          const entry = frameCache.get(idx);
+          entry.lastUsed = Date.now();
+          return { index: idx, img: entry.img };
         }
       }
       for (let idx = targetIndex + 1; idx <= TOTAL_FRAMES; idx++) {
-        if (loadedImages.has(idx)) {
-          return { index: idx, img: loadedImages.get(idx) };
+        if (frameCache.has(idx)) {
+          const entry = frameCache.get(idx);
+          entry.lastUsed = Date.now();
+          return { index: idx, img: entry.img };
         }
       }
     } else {
-      // Scrolling in reverse: search forward towards where user just came from
       for (let idx = targetIndex + 1; idx <= TOTAL_FRAMES; idx++) {
-        if (loadedImages.has(idx)) {
-          return { index: idx, img: loadedImages.get(idx) };
+        if (frameCache.has(idx)) {
+          const entry = frameCache.get(idx);
+          entry.lastUsed = Date.now();
+          return { index: idx, img: entry.img };
         }
       }
       for (let idx = targetIndex - 1; idx >= 1; idx--) {
-        if (loadedImages.has(idx)) {
-          return { index: idx, img: loadedImages.get(idx) };
+        if (frameCache.has(idx)) {
+          const entry = frameCache.get(idx);
+          entry.lastUsed = Date.now();
+          return { index: idx, img: entry.img };
         }
       }
     }
@@ -301,7 +351,6 @@
             MAX_VIRTUAL_SCROLL
           );
           requestRender();
-          updateUIState();
           return;
         }
         // Once targetVirtualScroll >= MAX_VIRTUAL_SCROLL (all frames completed!):
@@ -318,7 +367,6 @@
             MAX_VIRTUAL_SCROLL
           );
           requestRender();
-          updateUIState();
           return;
         }
       }
@@ -351,7 +399,6 @@
               MAX_VIRTUAL_SCROLL
             );
             requestRender();
-            updateUIState();
             return;
           }
         } else if (deltaY < 0) {
@@ -364,7 +411,6 @@
               MAX_VIRTUAL_SCROLL
             );
             requestRender();
-            updateUIState();
             return;
           }
         }
@@ -381,20 +427,18 @@
         e.preventDefault();
         targetVirtualScroll = clamp(targetVirtualScroll + 160, 0, MAX_VIRTUAL_SCROLL);
         requestRender();
-        updateUIState();
       }
     } else if (e.key === 'ArrowUp' || e.key === 'PageUp') {
       if (targetVirtualScroll > 0) {
         e.preventDefault();
         targetVirtualScroll = clamp(targetVirtualScroll - 160, 0, MAX_VIRTUAL_SCROLL);
         requestRender();
-        updateUIState();
       }
     }
   }
 
   function onWindowScroll() {
-    updateUIState();
+    requestRender();
 
     if (window.scrollY > 40) {
       // Scrolled down into the homepage content
@@ -410,16 +454,16 @@
   }
 
   function updateUIState() {
-    // Determine the real physical boundary of the cinematic hero container
-    const heroHeight = scrollContainer ? scrollContainer.offsetHeight : window.innerHeight;
-    // Solid ivory header ONLY when user has scrolled beyond the cinematic animation section into content below
-    const isBeyondHero = window.scrollY >= (heroHeight - 80);
+    // Phase 5: Use cached layout height to prevent synchronous layout reflow
+    const isBeyondHero = window.scrollY >= (cachedHeroHeight - 80);
 
     if (siteHeader) {
       siteHeader.classList.toggle('header-scrolled', isBeyondHero);
     }
     if (scrollIndicator) {
-      scrollIndicator.style.opacity = (targetVirtualScroll < 200 && window.scrollY <= 2) ? '1' : '0';
+      const showIndicator = (targetVirtualScroll < 200 && window.scrollY <= 2);
+      scrollIndicator.style.opacity = showIndicator ? '1' : '0';
+      scrollIndicator.style.pointerEvents = showIndicator ? 'auto' : 'none';
     }
   }
 
@@ -468,6 +512,9 @@
         lastDrawnFrameIndex = bestFrame.index;
       }
     }
+
+    // Phase 5: Batch UI state with rAF to eliminate mid-scroll layout thrashing
+    updateUIState();
 
     if (currentVirtualScroll !== targetVirtualScroll) {
       requestRender();
@@ -1371,15 +1418,16 @@
       currentFrameIndex = 1;
     }
 
+    updateCachedLayout();
     resizeCanvas();
 
     // 1. Immediately request Frame 1
     fetchFrame(1);
 
-    // 2. Start preloading the neighborhood around frame 1
-    updatePriorityPreload(1);
-
-    // 3. Start high-throughput background preloader pump
+    // 2. Preload only initial warmup buffer (12-14 frames)
+    for (let i = 2; i <= INITIAL_WARMUP_FRAMES; i++) {
+      priorityQueue.push(i);
+    }
     pumpLoader();
 
     // 4. Input listeners with smooth completion-aware transitions
@@ -1389,6 +1437,7 @@
     window.addEventListener('keydown', onKeyDown);
     window.addEventListener('scroll', onWindowScroll, { passive: true });
     window.addEventListener('resize', () => {
+      updateCachedLayout();
       resizeCanvas();
       updateUIState();
     }, { passive: true });
